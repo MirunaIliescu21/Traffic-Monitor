@@ -1,0 +1,13 @@
+# Date generate la rulare — nu se versionează
+traffic_monitor.db
+alerts.log
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# OS
+.DS_Store

@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""
+Etapa 3 (v2): Monitor continuu pe fundal.
+
+Model NOU, diferit de v1:
+- NU mai cere aprobare (d/n) pentru fiecare conexiune - prea multe,
+  Firefox singur generează zeci pe minut, e nepractic
+- Rulează CONTINUU pe fundal, colectând tot traficul (ca collector.py)
+- Notifică INFORMATIV, o singură dată, când vede o combinație
+  (proces, IP) nouă - fără să blocheze, fără să ceară răspuns
+- La fiecare ANALYSIS_INTERVAL_SECONDS, rulează analiza de risc
+  (concentrare + beaconing + reputație, din baseline.py) pe datele
+  proaspăt colectate și trimite o alertă ACTIVĂ doar dacă găsește
+  ceva cu adevărat suspect (scor >= 50)
+
+Rulare: sudo python3 watcher.py
+Oprire: Ctrl+C
+"""
+
+import psutil
+import sqlite3
+import subprocess
+import ipaddress
+import hashlib
+import socket
+import os
+import pwd
+import time
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
+
+from baseline_v5 import (
+    is_private_ip, analyze_process, deduplicate_into_sessions,
+    MIN_SAMPLES_FOR_BASELINE,
+)
+from reputation import init_reputation_table
+
+DB_PATH = "traffic_monitor.db"
+ALERTS_LOG_PATH = "alerts.log"
+POLL_INTERVAL_SECONDS = 1          # cât de des verificăm conexiunile active
+                                     # (la 1s prindem și conexiuni scurte, gen curl -m 2;
+                                     # la 3s+ le rataserăm, exact problema descoperită la collector.py)
+ANALYSIS_INTERVAL_SECONDS = 120    # cât de des rulăm analiza de risc completă (2 minute)
+RISK_ALERT_THRESHOLD = 50          # scor de la care trimitem alertă activă (nu doar informativă)
+
+
+# ---------- Notificări desktop, corect configurate pentru sudo ----------
+
+def log_alert_to_file(message: str) -> None:
+    """
+    Scrie orice alertă (inbound sau risc ridicat) într-un fișier text
+    permanent, INDIFERENT ce face desktop-ul cu popup-ul.
+
+    De ce: notificările "critical" din GNOME rămân pe ecran până le
+    închizi manual, dar unele versiuni nu le arhivează în istoricul de
+    notificări după închidere - poți pierde complet urma alertei.
+    Fișierul ăsta e o evidență permanentă, utilă și ca jurnal de audit.
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    with open(ALERTS_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] {message}\n")
+
+
+def get_desktop_user_env() -> dict:
+    """
+    Când scriptul rulează cu sudo, procesul e root și NU are acces la
+    sesiunea grafică a utilizatorului (DBUS_SESSION_BUS_ADDRESS, DISPLAY).
+    Reconstruim aceste variabile pentru utilizatorul original (cel care
+    a dat sudo), ca notify-send să știe către ce desktop să trimită popup-ul.
+    """
+    sudo_user = os.environ.get("SUDO_USER")
+    if not sudo_user:
+        return os.environ.copy()  # nu rulează cu sudo, mediul e deja corect
+
+    try:
+        uid = pwd.getpwnam(sudo_user).pw_uid
+    except KeyError:
+        return os.environ.copy()
+
+    env = os.environ.copy()
+    env["DISPLAY"] = env.get("DISPLAY", ":0")
+    env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{uid}/bus"
+    return env
+
+
+def send_desktop_notification(title: str, message: str, urgency: str = "normal") -> None:
+    """Trimite un popup nativ Ubuntu, rulat ca utilizatorul desktop, nu ca root."""
+    sudo_user = os.environ.get("SUDO_USER")
+    env = get_desktop_user_env()
+
+    try:
+        if sudo_user:
+            # rulăm notify-send explicit ca utilizatorul original, nu ca root
+            subprocess.run(
+                ["sudo", "-u", sudo_user, "notify-send",
+                 f"--urgency={urgency}", "--icon=dialog-information", title, message],
+                env=env, timeout=3, check=False,
+            )
+        else:
+            subprocess.run(
+                ["notify-send", f"--urgency={urgency}", title, message],
+                env=env, timeout=3, check=False,
+            )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        pass  # nu blocăm scriptul dacă notificarea eșuează
+
+
+# ---------- Colectare (identică ca logică cu collector.py) ----------
+
+def init_db(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS connections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            pid INTEGER,
+            process_name TEXT,
+            binary_path TEXT,
+            binary_hash TEXT,
+            local_ip TEXT,
+            local_port INTEGER,
+            remote_ip TEXT,
+            remote_port INTEGER,
+            protocol TEXT,
+            status TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_process_time ON connections (process_name, timestamp)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS notified_pairs (
+            process_name TEXT NOT NULL,
+            remote_ip TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            PRIMARY KEY (process_name, remote_ip)
+        )
+    """)
+    # NOU: conexiuni PRIMITE (cineva se conectează la tine, nu invers)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS inbound_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            process_name TEXT,
+            local_port INTEGER,
+            remote_ip TEXT,
+            remote_port INTEGER
+        )
+    """)
+    # NOU: starea alertelor de risc, persistată între reporniri.
+    # Fără această tabelă, la fiecare repornire a watcher-ului,
+    # risk_alert_state era un dict gol -> prima analiză retrimite alertele
+    # pentru TOATE procesele suspecte din baza de date, ca și cum ar fi
+    # prima dată, chiar dacă nimic nou nu s-a întâmplat.
+    # Cu această tabelă: watcher-ul știe la pornire ce știa înainte să fie
+    # oprit -> reporniri curate, fără "furtuni de alerte".
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS risk_alert_state (
+            process_name TEXT PRIMARY KEY,
+            last_alerted_count INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+
+def hash_binary(path: str) -> str | None:
+    if not path:
+        return None
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except (PermissionError, FileNotFoundError, OSError):
+        return None
+
+
+def get_process_info(pid: int, cache: dict) -> tuple[str, str, str]:
+    if pid in cache:
+        return cache[pid]
+    try:
+        proc = psutil.Process(pid)
+        info = (proc.name(), proc.exe(), hash_binary(proc.exe()))
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        info = ("unknown", None, None)
+    cache[pid] = info
+    return info
+
+
+def resolve_hostname(ip: str, cache: dict) -> str:
+    """
+    DNS invers: încearcă să afle numele de domeniu asociat unui IP
+    (ex. "185.125.190.36" -> "azure.microsoft.com"). Util ca să
+    recunoști imediat "a, asta e Digi Storage", nu doar un IP anonim.
+
+    Nu toate IP-urile au un nume invers înregistrat - în acel caz,
+    întoarcem IP-ul neschimbat, fără eroare.
+
+    Cache în memorie, ca să nu facem o cerere DNS nouă la fiecare
+    conexiune către același IP (ar fi lent și inutil).
+    """
+    if ip in cache:
+        return cache[ip]
+    try:
+        hostname, _, _ = socket.gethostbyaddr(ip)
+        cache[ip] = hostname
+    except (socket.herror, socket.gaierror, OSError):
+        cache[ip] = ip  # fără nume găsit, rămânem cu IP-ul brut
+    return cache[ip]
+
+
+def is_effectively_loopback(ip: str) -> bool:
+    """
+    Verifică dacă un IP e loopback (127.x.x.x, ::1), INCLUSIV varianta
+    IPv6 "împachetată" (::ffff:127.0.0.1) - un format special, frecvent
+    la conexiuni locale pe sisteme cu IPv6 activ, pe care Python NU îl
+    recunoaște automat ca loopback din is_loopback simplu.
+    """
+    try:
+        addr = ipaddress.ip_address(ip.split("%")[0])
+        if addr.is_loopback:
+            return True
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+            return addr.ipv4_mapped.is_loopback
+        return False
+    except ValueError:
+        return False
+
+
+def collect_and_notify(conn: sqlite3.Connection, process_cache: dict, notified_pairs: set,
+                        notified_inbound: set, hostname_cache: dict) -> int:
+    """
+    O trecere de colectare: salvează toate conexiunile active (ca collector.py),
+    trimite notificare informativă pentru conexiuni IEȘITE noi, și ALERTĂ
+    IMEDIATĂ pentru conexiuni PRIMITE (cineva se conectează la tine).
+
+    Distincția ieșit/primit: mai întâi identificăm porturile locale aflate
+    în stare LISTEN (adică "ascultăm" pe ele, suntem server). O conexiune
+    ESTABLISHED al cărei port local se potrivește cu un port LISTEN e o
+    conexiune PRIMITĂ - cineva din exterior a inițiat-o, nu tu.
+    """
+    timestamp = datetime.now(timezone.utc).isoformat()
+    all_conns = list(psutil.net_connections(kind="inet"))
+
+    # pasul 1: identificăm porturile pe care laptopul tău ASCULTĂ chiar acum
+    listening_ports = {
+        c.laddr.port for c in all_conns
+        if c.status == "LISTEN" and c.laddr
+    }
+
+    rows = []
+
+    for conn_info in all_conns:
+        if not conn_info.raddr or not conn_info.pid:
+            continue
+
+        remote_ip = conn_info.raddr.ip
+        remote_port = conn_info.raddr.port
+        local_port = conn_info.laddr.port if conn_info.laddr else None
+        pid = conn_info.pid
+
+        name, exe_path, binary_hash = get_process_info(pid, process_cache)
+        protocol = "TCP" if conn_info.type == 1 else "UDP"
+
+        rows.append((
+            timestamp, pid, name, exe_path, binary_hash,
+            conn_info.laddr.ip if conn_info.laddr else None,
+            local_port, remote_ip, remote_port, protocol, conn_info.status,
+        ))
+
+        is_inbound = (
+            conn_info.status == "ESTABLISHED"
+            and local_port in listening_ports
+            and not is_effectively_loopback(remote_ip)
+        )
+
+        if is_inbound:
+            # NOU: conexiune PRIMITĂ - cineva s-a conectat la tine.
+            # NU filtrăm IP-uri private aici (spre deosebire de traficul ieșit) -
+            # un atacator pe aceeași rețea locală (ex. Kali în VirtualBox) are
+            # tot un IP privat, dar tot vrem să te alerteze despre el.
+            #
+            # cheia include remote_port: fiecare CONEXIUNE NOUĂ (chiar de la
+            # același IP, către același port local) are un remote_port diferit,
+            # alocat aleator de sistemul de operare al atacatorului la fiecare
+            # reconectare - fără remote_port în cheie, a doua reconectare de la
+            # Kali nu mai declanșa alertă, deși era o încercare nouă, reală.
+            inbound_key = (name, remote_ip, local_port, remote_port)
+            if inbound_key in notified_inbound:
+                continue
+            notified_inbound.add(inbound_key)
+
+            conn.execute(
+                "INSERT INTO inbound_events (timestamp, process_name, local_port, remote_ip, remote_port) VALUES (?, ?, ?, ?, ?)",
+                (timestamp, name, local_port, remote_ip, remote_port)
+            )
+            log_alert_to_file(
+                f"[INBOUND] {remote_ip}:{remote_port} -> {name} (port local {local_port})"
+            )
+            send_desktop_notification(
+                "🔴 Conexiune PRIMITĂ - cineva te-a contactat",
+                f"{remote_ip} s-a conectat la {name} (portul tău {local_port})",
+                urgency="critical",
+            )
+            print(f"[INBOUND!] {remote_ip}:{remote_port} -> {name} (port local {local_port})")
+            continue  # nu mai trecem și prin logica de "ieșit" pentru aceeași conexiune
+
+        # notificare INFORMATIVĂ pentru conexiuni IEȘITE noi (logica veche, neschimbată)
+        if is_private_ip(remote_ip):
+            continue
+        pair = (name, remote_ip)
+        if pair in notified_pairs:
+            continue
+
+        notified_pairs.add(pair)
+        conn.execute(
+            "INSERT OR IGNORE INTO notified_pairs (process_name, remote_ip, first_seen_at) VALUES (?, ?, ?)",
+            (name, remote_ip, timestamp)
+        )
+        hostname = resolve_hostname(remote_ip, hostname_cache)
+        display_dest = hostname if hostname != remote_ip else remote_ip
+        send_desktop_notification(
+            "Conexiune nouă observată",
+            f"{name} -> {display_dest}",
+            urgency="low",
+        )
+        print(f"[info] Conexiune nouă: {name} -> {display_dest} ({remote_ip})")
+
+    if rows:
+        conn.executemany("""
+            INSERT INTO connections (
+                timestamp, pid, process_name, binary_path, binary_hash,
+                local_ip, local_port, remote_ip, remote_port, protocol, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        conn.commit()
+
+    return len(rows)
+
+
+# ---------- Persistare risk_alert_state ----------
+
+def load_risk_alert_state(conn: sqlite3.Connection) -> dict:
+    """
+    Încarcă din SQLite starea alertelor de risc de la rularea anterioară.
+    Apelat O SINGURĂ DATĂ la pornirea watcher-ului, în loc de dict gol.
+    """
+    cur = conn.execute("SELECT process_name, last_alerted_count FROM risk_alert_state")
+    state = {row[0]: row[1] for row in cur.fetchall()}
+    if state:
+        print(f"[*] Am încărcat starea alertelor pentru {len(state)} procese din rularea anterioară")
+    return state
+
+
+def save_risk_alert_state(conn: sqlite3.Connection, process_name: str, count: int) -> None:
+    """
+    Salvează în SQLite numărul de conexiuni la momentul ultimei alerte,
+    pentru un proces dat. Apelat DUPĂ fiecare alertă trimisă.
+    """
+    conn.execute("""
+        INSERT INTO risk_alert_state (process_name, last_alerted_count, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(process_name) DO UPDATE SET
+            last_alerted_count = excluded.last_alerted_count,
+            updated_at = excluded.updated_at
+    """, (process_name, count, datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+
+
+# ---------- Analiză periodică de risc (reutilizează baseline.py) ----------
+
+def run_risk_analysis(conn: sqlite3.Connection, risk_alert_state: dict) -> None:
+    """
+    Rulează exact aceeași logică din baseline.py (concentrare, beaconing,
+    reputație) pe datele acumulate până acum, și trimite o alertă ACTIVĂ
+    (urgency=critical) doar pentru procesele cu scor >= RISK_ALERT_THRESHOLD.
+
+    NOU: risc_alert_state ține minte, per proces, câte conexiuni (totale)
+    avea la ULTIMA alertă trimisă. Dacă numărul nu s-a schimbat față de
+    ultima dată (adică nu a apărut trafic nou), NU retrimitem popup -
+    altfel un proces suspect declanșa aceeași alertă la infinit, la
+    fiecare 2 minute, chiar dacă nu se întâmpla nimic nou (bug descoperit
+    empiric: curl-ul de test oprit încă apărea "detectat" identic, de 3
+    ori la rând, doar pentru că analiza re-evalua aceleași date vechi).
+    """
+    # FEREASTRA DE TIMP: analizăm doar ultimele 24h, nu tot istoricul.
+    # Motivul: la polling de 1s, baza de date crește cu sute de mii de
+    # rânduri pe zi. Fără limită de timp, fiecare ciclu de analiză devine
+    # progresiv mai lent - după câteva zile de rulare continuă, ajunge să
+    # dureze secunde, apoi zeci de secunde. Cu fereastra de 24h, query-ul
+    # citește mereu aproximativ același număr de rânduri, deci performanța
+    # rămâne constantă indiferent cât timp a rulat aplicația.
+    # Conceptual: un malware care a "bătut" la un IP acum 3 zile și nu
+    # mai face nimic nu e un risc ACTIV azi - fereastra de 24h e și
+    # corectă din perspectiva securității, nu doar de performanță.
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    cur = conn.execute("""
+        SELECT process_name, timestamp, remote_ip, remote_port
+        FROM connections
+        WHERE timestamp > ?
+        ORDER BY process_name, timestamp
+    """, (cutoff,))
+    by_process = defaultdict(list)
+    for process_name, timestamp, remote_ip, remote_port in cur.fetchall():
+        by_process[process_name].append({
+            "timestamp": datetime.fromisoformat(timestamp),
+            "remote_ip": remote_ip,
+            "remote_port": remote_port,
+        })
+
+    all_destinations = defaultdict(set)
+    for process_name, conns in by_process.items():
+        for c in conns:
+            all_destinations[c["remote_ip"]].add(process_name)
+
+    print(f"\n[analiza] Rulez evaluarea de risc pe {len(by_process)} procese...")
+    for process_name, conns in by_process.items():
+        report = analyze_process(process_name, conns, all_destinations, conn)
+        if report["risk_score"] < RISK_ALERT_THRESHOLD:
+            continue
+
+        current_count = report["total_connections"]
+        last_alerted_count = risk_alert_state.get(process_name)
+
+        # afișăm TOATE motivele, nu doar primele 2
+        reasons_text = "\n      ".join(report["reasons"])
+        key_reasons = [r for r in report["reasons"] if "CONCENTRAT" in r or "BEACONING" in r or "Reputa" in r]
+        summary = "; ".join(key_reasons) if key_reasons else reasons_text
+
+        if last_alerted_count == current_count:
+            # nimic nou față de ultima alertă - doar notă discretă în consolă, fără popup
+            print(f"[risc neschimbat] {process_name}: tot la {report['risk_score']}/100, fără activitate nouă (nu retrimit popup)")
+            continue
+
+        print(f"[ALERTĂ] {process_name}: risc {report['risk_score']}/100")
+        print(f"      {reasons_text}")
+        log_alert_to_file(f"[RISC {report['risk_score']}/100] {process_name}: {summary}")
+        send_desktop_notification(
+            f"⚠️ Risc ridicat: {process_name}",
+            f"Scor {report['risk_score']}/100 - {summary}",
+            urgency="critical",
+        )
+        # actualizăm atât în memorie (pentru ciclurile următoare din
+        # aceeași sesiune) cât și în SQLite (pentru reporniri viitoare)
+        risk_alert_state[process_name] = current_count
+        save_risk_alert_state(conn, process_name, current_count)
+
+    print("[analiza] Terminat.\n")
+
+
+# ---------- Bucla principală ----------
+
+def main():
+    print(f"[*] Pornesc monitorul continuu")
+    print(f"[*] Polling conexiuni: {POLL_INTERVAL_SECONDS}s | Analiză risc: la fiecare {ANALYSIS_INTERVAL_SECONDS}s")
+    print("[*] Ctrl+C pentru oprire\n")
+
+    conn = sqlite3.connect(DB_PATH)
+    init_db(conn)
+    init_reputation_table(conn)
+
+    # încărcăm ce combinații am notificat deja (din rulări anterioare)
+    cur = conn.execute("SELECT process_name, remote_ip FROM notified_pairs")
+    notified_pairs = {(row[0], row[1]) for row in cur.fetchall()}
+    print(f"[*] {len(notified_pairs)} combinații (proces, IP) deja notificate anterior\n")
+
+    process_cache: dict = {}
+    hostname_cache: dict = {}
+    notified_inbound: set = set()
+    # FIX: înlocuim dict-ul gol cu încărcarea din SQLite.
+    # Dacă watcher-ul a mai rulat înainte, știe deja ce procese
+    # erau suspecte și câte conexiuni aveau la ultima alertă -
+    # nu va mai retrimite alertele pentru ele la repornire.
+    risk_alert_state: dict = load_risk_alert_state(conn)
+    last_analysis = time.time()
+
+    try:
+        while True:
+            start = time.time()
+            n = collect_and_notify(conn, process_cache, notified_pairs, notified_inbound, hostname_cache)
+
+            if len(process_cache) > 500:
+                process_cache.clear()
+
+            if time.time() - last_analysis >= ANALYSIS_INTERVAL_SECONDS:
+                run_risk_analysis(conn, risk_alert_state)
+                last_analysis = time.time()
+
+            elapsed = time.time() - start
+            time.sleep(max(0, POLL_INTERVAL_SECONDS - elapsed))
+
+    except KeyboardInterrupt:
+        print("\n[*] Monitor oprit de utilizator.")
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()

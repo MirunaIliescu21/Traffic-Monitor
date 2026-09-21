@@ -1,0 +1,5 @@
+[2026-08-17 13:46:05 UTC] [INBOUND] 192.168.56.102:41516 -> nc (port local 8888)
+[2026-08-17 13:47:50 UTC] [INBOUND] 192.168.56.102:49234 -> nc (port local 8888)
+[2026-08-17 13:49:23 UTC] [RISC 80/100] curl: Trafic CONCENTRAT: 100% din conexiunile externe merg către un singur IP (93.184.216.34), din doar 1 destinații distincte total - IP văzut DOAR la acest proces, la niciun altul; Pattern de BEACONING extern: conexiuni la interval regulat de ~62s (deviație std: 0.05s, variație relativă: 0%) - semn tipic de comunicare automatizată cu un server C2
+[2026-08-17 13:50:18 UTC] [INBOUND] 192.168.56.102:49234 -> nc (port local 8888)
+[2026-08-17 13:51:00 UTC] [INBOUND] 192.168.56.102:42828 -> nc (port local 4444)
