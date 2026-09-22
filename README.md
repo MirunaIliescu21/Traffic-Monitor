@@ -118,6 +118,11 @@ confundau euristica de `/48`, producând un grup fals `::/48` care ar fi înghes
 indiferent de destinația reală - a doua oară când acest format cauzează o problemă subtilă în proiect,
 după cea deja documentată în `is_effectively_loopback()`.
 
+### Ce am deja rezolvat, în watcher_v6.py:
+
+`notified_pairs `— un (proces, IP) o dată notificat nu se mai repetă niciodată (evită să retrimită la infinit aceeași pereche)
+`risk_alert_state` — pentru alertele de risc (concentrare/beaconing), nu retrimite dacă datele n-au adus nimic nou
+ (asta a fost regresia cu curl retrimis de 3 ori, reparată și testată)
 
 ## Mediu de testare
 
