@@ -124,6 +124,39 @@ după cea deja documentată în `is_effectively_loopback()`.
 `risk_alert_state` — pentru alertele de risc (concentrare/beaconing), nu retrimite dacă datele n-au adus nimic nou
  (asta a fost regresia cu curl retrimis de 3 ori, reparată și testată)
 
+
+ Cu plăcere — hai să punem cap la cap toată ziua de azi, de la motivul inițial până la ce rulează acum, live, pe mașina ta.
+
+### watcher_v6.py + experimnet_reverse_dns_2.py => watrcher_v6_eperiment.py
+
+Sistemul de dinainte trata la fel orice conexiune nouă: `firefox` care vizitează un site nou și un proces necunoscut care vorbește brusc cu un IP nou arătau identic — "n-am mai văzut asta". Ideea whitelist-ului era să înlocuiască semnalul ăsta brut cu unul calitativ diferit: **"acest proces are un comportament stabilit, iar asta îl încalcă"** — mai aproape de premisa centrală a tezei (trafic anormal = semn de compromitere), care presupune că știi ce e normal pentru procesul respectiv.
+
+## Ce am construit, bucată cu bucată, testat izolat înainte de a atinge codul principal
+
+1. **Reverse DNS** (`resolve_domain`) — am aflat empiric că doar ~43% din IP-urile externe au reverse DNS configurat. Nu e o eroare de-a noastră, e o limitare reală a internetului, bună de documentat.
+
+2. **Extragere domeniu de bază** (`extract_base_domain`) — `lb-140-82-112-21-iad.github.com` → `github.com`. Testat pe exemple reale din datele tale, cu o limitare cunoscută și asumată (domenii tip `.co.uk`).
+
+3. **Fallback pe subnet** pentru IP-urile fără reverse DNS — grupare pe `/24` (IPv4) / `/48` (IPv6). Am descoperit empiric că ajută mult pe infrastructuri compacte (Google, Cloudflare pe IPv6), dar aproape deloc pe cloud-uri mari și împrăștiate (Azure) — o limitare reală, nu un bug.
+
+4. **Un bug real prins pe parcurs**: IP-uri IPv4-mascate-ca-IPv6 (`::ffff:34.78.67.165`) produceau un grup fals `::/48`. Reparat, folosind `addr.ipv4_mapped` — a doua oară când formatul ăsta cauzează o problemă subtilă în proiect (prima fiind la `is_effectively_loopback()`).
+
+5. **Regula de bază**: proces deja cunoscut + destinație (domeniu/subnet) niciodată văzută → alertă. Proces complet nou → doar înregistrăm, fără alertă (n-avem încă "normal" de comparat).
+
+6. **Cooldown** — testat direct pe burst-ul tău real cu Chrome (11 alerte în 18 secunde, din cauza deschiderii Netflix): 5 minute de cooldown per proces au redus 15 candidate la 4 alerte reale, fără să piardă nimic (tot intră în `known_destinations`, doar nu mai spamează).
+
+## Integrarea în `watcher_v6.py`
+
+- **2 tabele noi**: `known_destinations`, `whitelist_alert_state` (cooldown persistat între reporniri, ca `risk_alert_state`)
+- **Backfill automat**, o singură dată, din istoricul deja colectat — ca să nu pornești de la zero deși ai luni de date
+- **Alertă nouă `[NOU-COMPORTAMENT]`**, complet aditivă — vechea `[info] Conexiune nouă` n-a fost atinsă, rulează în paralel
+
+## Confirmarea finală
+
+Ai validat totul de **două ori independent**: o rulare continuă normală, și un reset complet (ștergere `known_destinations`/`notified_pairs`/stări, păstrând istoricul `connections`) — în ambele cazuri, backfill-ul a recuperat corect toate datele (74 de perechi), iar regula a extras un număr mic, plauzibil de alerte reale dintr-un volum mare de zgomot brut (`[info]`).
+
+Practic, ai acum un lanț complet și testat: **IP brut → domeniu/subnet → istoric per proces → cooldown → alertă**, plus dovezi empirice (nu doar teorie) pentru fiecare decizie de design — exact genul de material solid pentru discuția cu profesorul.
+
 ## Mediu de testare
 
 - Ubuntu 24.04 ca host
