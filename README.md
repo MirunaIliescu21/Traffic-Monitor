@@ -92,6 +92,33 @@ destinațiile obișnuite, astfel încât alerta reală să fie "acest proces ies
 din comportamentul lui stabilit", nu doar "n-am mai văzut asta niciodată" —
 reducând falsele pozitive și apropiind sistemul de premisa lui inițială.
 
+## experiment_reverse_dns_1.py - rezolvarea destinațiilor (domeniu → subnet → IP)
+
+Am construit un mecanism de **grupare a destinațiilor externe** care încearcă,
+în ordine, trei metode, fiecare fiind un fallback pentru cea anterioară.
+
+Prima metodă, **reverse DNS** (`resolve_domain`), întreabă sistemul cui aparține un IP 
+și, dacă răspunde, `extract_base_domain` reduce hostname-ul complet la domeniul lui
+de bază (`lb-140-82-112-21-iad.github.com` → `github.com`) - aceasta e categoria **"domeniu"**,
+cea mai de încredere, pentru că grupează corect indiferent cât de mult rotește furnizorul
+IP-urile din spate (confirmat pe date reale: `github.com`, `1e100.net`, `amazonaws.com`, `fbcdn.net` etc.).
+
+Când reverse DNS eșuează și am văzut empiric că se întâmplă la aproape 60% din IP-urile externe,
+mai ales pe IPv6, intervine a doua metodă, categoria **"subnet"**: grupăm IP-ul după blocul lui 
+de rețea (`/24` pentru IPv4, `/48` pentru IPv6), pe ipoteza că adrese vecine aparțin aceleiași infrastructuri.
+Testat pe date reale, fallback-ul ăsta a redus numărul de perechi distincte de la 63 la 47 - ajută consistent 
+pe infrastructuri regionale/compacte (Google, Cloudflare pe IPv6), dar nu face nimic pentru furnizori mari de 
+cloud cu alocare împrăștiată (Azure, la `code`, a rămas cu IP-uri complet separate chiar și după grupare). 
+
+Categoria a treia, **"ip"**, e fallback-ul ultim, IP-ul e păstrat ca atare, fără nicio grupare și practic nu
+se mai declanșează acum, decât dacă adresa nici măcar nu poate fi parsată. 
+
+Pe parcurs am descoperit și reparat un bug real: IP-urile IPv4-mascate-ca-IPv6 (`::ffff:34.78.67.165`) 
+confundau euristica de `/48`, producând un grup fals `::/48` care ar fi înghesuit laolaltă orice astfel de adresă, 
+indiferent de destinația reală - a doua oară când acest format cauzează o problemă subtilă în proiect,
+după cea deja documentată în `is_effectively_loopback()`.
+
+
 ## Mediu de testare
 
 - Ubuntu 24.04 ca host
