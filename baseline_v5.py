@@ -49,6 +49,14 @@ CONCENTRATION_WEIGHT = 30          # puncte de risc pt. trafic concentrat pe pu�
 BEACONING_WEIGHT = 50              # puncte de risc pt. pattern de beaconing
 VOLUME_ANOMALY_WEIGHT = 20         # puncte de risc pt. volum neobișnuit de mare
 
+MAX_BURST_GAP_SECONDS = 600        # gol de peste 10 min = sesiune de activitate SEPARATĂ, nu continuare
+                                     # DESCOPERIT EMPIRIC: media/deviația standard NU sunt robuste la
+                                     # valori extreme - un singur gol mare (ex. o pauză de zile între
+                                     # două sesiuni de trafic ale aceluiași proces) poate distruge complet
+                                     # calculul de regularitate, mascând un pattern altfel aproape perfect
+                                     # (caz real: 44 de sesiuni perfect regulate la ~62s, CV=0.2% izolat,
+                                     # dar CV=781% dacă intră în calcul și un gol de 35 de zile din urmă)
+
 # Praguri pentru regula de CONCENTRARE (înlocuiește vechea regulă de "unicitate")
 MAX_DISTINCT_IPS_FOR_CONCENTRATION = 3   # dacă procesul vorbește cu MAI MULTE IP-uri distincte decât atât, îl considerăm "divers" (normal), nu concentrat
 CONCENTRATION_RATIO_THRESHOLD = 0.7      # dacă un singur IP acoperă peste 70% din conexiunile externe, e concentrare suspectă
@@ -95,6 +103,32 @@ def deduplicate_into_sessions(connections: list) -> list:
     # reordonăm cronologic (am sortat după destinație mai sus, pentru grupare)
     sessions.sort(key=lambda c: c["timestamp"])
     return sessions
+
+
+def split_into_bursts(timestamps: list, max_gap_seconds: float = MAX_BURST_GAP_SECONDS) -> list:
+    """
+    Împarte o listă ordonată de timestamp-uri în "burst-uri" separate,
+    acolo unde golul dintre două timestamp-uri consecutive depășește
+    max_gap_seconds. Complementul lui deduplicate_into_sessions: acolo
+    uneam evenimente prea apropiate (polling dublu), aici separăm
+    evenimente prea depărtate (sesiuni de activitate distincte).
+
+    De ce contează: analiza de regularitate (beaconing) calculează media
+    și deviația standard a intervalelor - ambele extrem de sensibile la
+    o singură valoare extremă. Fără separare pe burst-uri, un gol mare
+    între două sesiuni de activitate distincte (ex. procesul a tăcut
+    zile întregi, apoi a reînceput) ar strica regularitatea calculată
+    pe tot istoricul, deși fiecare sesiune în parte poate fi perfect
+    regulată.
+    """
+    if not timestamps:
+        return []
+    bursts = [[timestamps[0]]]
+    for t in timestamps[1:]:
+        if (t - bursts[-1][-1]).total_seconds() > max_gap_seconds:
+            bursts.append([])
+        bursts[-1].append(t)
+    return bursts
 
 
 def load_connections(conn: sqlite3.Connection) -> dict:
@@ -201,7 +235,22 @@ def analyze_process(process_name: str, connections: list, all_destinations: dict
 
     # --- 2. Regularitatea intervalelor, CALCULATĂ DOAR PE TRAFIC EXTERN ---
     # (beaconing către routerul local e normal; beaconing către internet, nu)
-    timestamps = sorted(c["timestamp"] for c in external_connections)
+    #
+    # NOU: împărțim mai întâi pe burst-uri (vezi split_into_bursts) și analizăm
+    # doar cel mai mare - altfel un gol mare între două sesiuni de activitate
+    # distincte (zile/săptămâni) distruge complet media/deviația standard,
+    # mascând un pattern de beaconing altfel foarte clar.
+    all_timestamps = sorted(c["timestamp"] for c in external_connections)
+    bursts = split_into_bursts(all_timestamps)
+    timestamps = max(bursts, key=len) if bursts else []
+
+    if len(bursts) > 1:
+        report["reasons"].append(
+            f"Activitate împărțită în {len(bursts)} sesiuni separate (gol > "
+            f"{MAX_BURST_GAP_SECONDS // 60:.0f} min); regularitatea se analizează "
+            f"doar pe cea mai mare ({len(timestamps)} evenimente)"
+        )
+
     if len(timestamps) >= MIN_SAMPLES_FOR_BASELINE:
         intervals = [
             (timestamps[i+1] - timestamps[i]).total_seconds()

@@ -227,3 +227,43 @@ class TestAnalyzeProcessRegressions:
         assert "CONCENTRAT" in reasons_joined
         assert "BEACONING" in reasons_joined
         assert len(report["reasons"]) >= 2  # cel puțin concentrare + beaconing, nu doar 1
+
+    def test_large_time_gap_between_sessions_does_not_mask_beaconing(self, db_conn):
+        """
+        REGRESIE: descoperit empiric la testarea reală - un proces cu trafic
+        perfect regulat (interval ~62s) într-o sesiune RECENTĂ, dar cu o
+        sesiune de test VECHE (la zile distanță) în același istoric, nu mai
+        era detectat ca beaconing deloc. Cauza: media/deviația standard
+        calculate pe TOT istoricul erau distruse de un singur gol enorm
+        (zile) - un caz clasic de ne-robustețe statistică la valori extreme.
+
+        Fix: split_into_bursts() separă sesiunile la goluri > 10 minute,
+        iar analiza de regularitate rulează doar pe cel mai mare burst.
+        """
+        old_burst_start = datetime.now(timezone.utc) - timedelta(days=35)
+        recent_burst_start = datetime.now(timezone.utc) - timedelta(hours=1)
+
+        connections = []
+        # sesiune veche, mică (13 conexiuni) - de acum 35 de zile
+        t = old_burst_start
+        for _ in range(13):
+            connections.append({"timestamp": t, "remote_ip": "93.184.216.34", "remote_port": 80})
+            t += timedelta(seconds=62)
+        # sesiune recentă, mare (44 conexiuni) - perfect regulată, acum
+        t = recent_burst_start
+        for _ in range(44):
+            connections.append({"timestamp": t, "remote_ip": "93.184.216.34", "remote_port": 80})
+            t += timedelta(seconds=62)
+
+        all_destinations = {"93.184.216.34": {"curl"}}
+        report = analyze_process("curl", connections, all_destinations)
+
+        reasons_joined = " ".join(report["reasons"])
+        assert "sesiuni separate" in reasons_joined.lower(), (
+            f"Ar trebui să raporteze că a găsit sesiuni separate: {report['reasons']}"
+        )
+        assert "BEACONING" in reasons_joined, (
+            f"Beaconing-ul din sesiunea recentă, perfect regulată, nu ar trebui "
+            f"mascat de golul de 35 de zile: {report['reasons']}"
+        )
+        assert report["risk_score"] >= 50
