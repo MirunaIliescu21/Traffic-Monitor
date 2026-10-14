@@ -1,6 +1,15 @@
 # Date generate la rulare — nu se versionează
 traffic_monitor.db
+traffic_monitor.db-wal
+traffic_monitor.db-shm
+*.db
+*.db-wal
+*.db-shm
 alerts.log
+alerts.log.bak
+
+# Secrete
+.env
 
 # Python
 __pycache__/
