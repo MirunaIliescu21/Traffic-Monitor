@@ -162,3 +162,80 @@ Practic, ai acum un lanț complet și testat: **IP brut → domeniu/subnet → i
 - Ubuntu 24.04 ca host
 - VirtualBox: VM-uri Kali Linux (atacator) și Metasploitable2 (țintă
   vulnerabilă) pentru scenarii de test controlate
+
+
+
+-----
+
+### Interfața web
+
+- **Procese active (24h)** — cine vorbește cu cine, câte conexiuni, câte
+  IP-uri distincte
+- **Jurnal alerte** — istoricul alertelor de risc
+- **Conexiuni primite (inbound)** — potențiale scanări/atacuri către mașină
+- **Conexiuni noi observate** — combinații (proces, IP) văzute prima dată
+
+Se auto-reîmprospătează la 5 secunde.
+
+### Probleme cunoscute
+
+- Rularea cu `sudo` e necesară ca `psutil` să vadă toate conexiunile (nu doar
+  ale userului curent), dar notificările desktop (`notify-send`) pot eșua cu
+  `ServiceUnknown: org.freedesktop.Notifications`, pentru că root nu are
+  acces direct la sesiunea D-Bus grafică a userului. Fără `sudo` dispare
+  eroarea, dar se pierde vizibilitatea pe procesele altor useri.
+- Detecția de beaconing e sensibilă la o singură întrerupere în pattern: un
+  gol izolat în intervalele altfel regulate poate crește suficient
+  coeficientul de variație încât să scape de sub prag, chiar dacă restul
+  traficului e clar regulat.
+
+## Whitelist comportamental (destinații cunoscute per proces)
+
+Pe lângă concentrare/beaconing, `watcher_v6.py` ține minte, per proces,
+ce destinații sunt "normale" pentru el, ca să deosebească o conexiune nouă
+banală (IP nou pentru un serviciu deja cunoscut) de o schimbare reală de
+comportament (proces cunoscut, infrastructură complet nouă).
+
+Lanțul de decizie, per conexiune ieșită:
+
+```
+IP -> reverse DNS (domeniu) -> dacă lipsește, subnet /24 (IPv4) sau /48 (IPv6)
+   -> compară cu known_destinations (proces, cheie)
+   -> dacă procesul e deja cunoscut ȘI cheia e complet nouă -> candidat de alertă
+   -> cooldown per proces (5 min) -> alertă reală ("[NOU-COMPORTAMENT]")
+```
+
+- Reverse DNS reușește pe doar ~43% din IP-urile externe observate — restul
+  cad pe fallback-ul de subnet, care ajută mult pe infrastructuri compacte
+  (Google, Cloudflare pe IPv6), dar aproape deloc pe cloud-uri mari cu
+  alocare împrăștiată (Azure)
+- IP-urile IPv4-mascate-ca-IPv6 (`::ffff:x.x.x.x`) primesc tratare specială
+  (a doua oară că acest format cauzează o capcană în proiect, după
+  `is_effectively_loopback()`)
+- Cooldown-ul per proces reduce zgomotul de burst (testat pe un caz real:
+  15 candidate -> 4 alerte reale, când Chrome a deschis Netflix și a atins
+  11 destinații Google/Netflix noi în 18 secunde)
+- La prima pornire, `known_destinations` se populează automat din tot
+  istoricul deja colectat (backfill), ca să nu pornească de la zero
+- Notificarea veche `[info] Conexiune nouă` rămâne neschimbată, complet
+  aditiv — `[NOU-COMPORTAMENT]` e un semnal separat, mai rar și mai relevant
+
+## Stadiu curent
+
+- Prototip funcțional, testat pe date reale capturate (Firefox, Chrome,
+  Cursor, VS Code, curl simulat, nc) și pe VM-uri Kali/Metasploitable2
+- 26 de teste automate (`test_baseline.py`, `test_watcher.py`), toate trec
+- Integrarea AbuseIPDB (reputație externă de IP) a fost eliminată — nu se
+  potrivea cu premisa centrală axată pe comportament, nu pe liste externe
+- Whitelist comportamental (domeniu/subnet + cooldown), validat pe date
+  reale, integrat în `watcher_v6.py` și în `experiment_reverse_dns.py`
+  (scriptul izolat folosit pentru dezvoltare incrementală, păstrat ca
+  documentație a procesului)
+
+## Următorii pași posibili
+
+- Rafinare ASN (în loc de subnet /24) pentru gruparea cloud-urilor mari,
+  cu o bază de date externă (ex. MaxMind GeoLite2-ASN)
+- Listă de sufixe publice (public suffix list) pentru `extract_base_domain`,
+  ca să trateze corect domenii tip `ceva.co.uk`
+- UI în dashboard pentru gestionarea manuală a whitelist-ului
