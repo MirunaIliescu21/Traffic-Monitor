@@ -2,7 +2,8 @@
 
 Instrument local de monitorizare a traficului de rețea și detecție de anomalii,
 inspirat de GlassWire. Proiect de licență — Facultatea de Automatică și
-Calculatoare, UPB.
+Calculatoare, UPB — care evoluează spre un produs pentru utilizatori
+non-tehnici (clienți Infologica Silverline).
 
 ## Premisa
 
@@ -17,115 +18,174 @@ Nu e un instrument de prevenție. E un instrument de **detecție**.
 
 ## Arhitectură
 
-```
-collector.py    -> colectează periodic conexiunile active proces<->IP, în SQLite
-baseline_v5.py  -> analizează istoricul, scorează fiecare proces 0-100
-watcher_v6.py   -> rulează continuu: colectare + alertare live + conexiuni inbound
-dashboard.py    -> interfață web Flask (doar citește din DB)
-traffic_monitor.db -> SQLite, partajată de toate componentele
+| Fișier | Rol |
+|---|---|
+| `watcher_v6.py` | Rulează continuu: colectează conexiunile, alertează live, detectează conexiuni primite și comportament nou |
+| `baseline_v5.py` | Analiza de risc: scor 0-100 per proces (concentrare + beaconing) |
+| `dashboard.py` | Interfață web Flask: arată starea și primește deciziile utilizatorului |
+| `destination_status.py` | Stările destinațiilor (de verificat / normal / suspect) și istoricul deciziilor |
+| `companies.py` | Traduce domenii și blocuri de IP-uri în nume de companii („Google”, „Microsoft”) |
+| `retention.py` | Șterge datele vechi din bază |
+| `collector.py` | Colectare brută, fără analiză (nu se rulează în paralel cu watcher-ul) |
+| `traffic_monitor.db` | SQLite, partajată de toate componentele (nu se versionează) |
+
+## Cum rulează
+
+Două procese, în terminale separate, pe aceeași `traffic_monitor.db`:
+
+```bash
+# Terminal 1 — colectare + alertare live
+python3 watcher_v6.py
+
+# Terminal 2 — dashboard web
+python3 dashboard.py
 ```
 
-Scorul de risc din `baseline_v5.py` se bazează pe două semnale:
+Apoi deschide `http://localhost:5000`. Rulează un singur watcher odată.
+
+Fără `sudo`, notificările desktop funcționează, dar `psutil` vede doar
+procesele utilizatorului curent. Cu `sudo` se văd toate procesele, dar
+notificările eșuează (vezi „Limitări”).
+
+## Interfața web
+
+- **De verificat** — destinații noi pentru programe cunoscute, cu butoanele
+  „E normal” și „Nu recunosc”, în limbaj simplu („chrome s-a conectat pentru
+  prima dată la Google”)
+- **Deciziile tale** și **Istoric decizii** — ce ai hotărât și când, cu
+  posibilitatea de a anula o decizie
+- **Procese active (24h)**, **Jurnal alerte**, **Conexiuni primite
+  (inbound)**, **Conexiuni noi observate**
+
+Se reîmprospătează la 5 secunde. Deciziile se aplică în ~1 secundă, fără
+repornirea watcher-ului.
+
+## Cum funcționează detecția
+
+### 1. Scor de risc (`baseline_v5.py`)
 
 - **Concentrare**: procesul vorbește cu foarte puține IP-uri fixe (≤3),
   concentrat pe unul singur (≥70% din trafic) — semn de canal C2
 - **Beaconing**: intervalele dintre conexiuni sunt suspect de regulate
   (coeficient de variație < 15%) — semn de comunicare automatizată
+- Activitatea e împărțită în sesiuni (goluri > 10 min), iar regularitatea se
+  analizează pe cea mai mare, ca un gol de zile să nu ascundă un beacon real
 
-`watcher_v6.py` mai detectează separat și **conexiuni inbound** neașteptate
-(potențiale scanări/atacuri primite), și un mecanism de **whitelist
-comportamental** (vezi secțiunea dedicată mai jos).
+### 2. Conexiuni primite (inbound)
 
-## Cum rulează
+Conexiunile către porturile pe care mașina ascultă generează alertă imediată,
+inclusiv de la IP-uri private (un atacator din aceeași rețea locală).
 
-Trei procese separate, în terminale diferite, pe aceeași `traffic_monitor.db`:
+### 3. Comportament nou, cu decizia utilizatorului
+
+Pentru fiecare conexiune ieșită, destinația primește o **entitate**: compania,
+dacă o cunoaștem (Google, Microsoft, Amazon...), altfel domeniul sau blocul de
+IP-uri (/24 pentru IPv4, /48 pentru IPv6).
+
+```
+conexiune ieșită -> entitate (companie / domeniu / bloc IP)
+   -> proces cunoscut ȘI entitate nouă pentru el -> notificare + „de verificat”
+   -> cooldown per proces (5 min) limitează notificările, nu și lista
+```
+
+Fiecare destinație are una din trei stări:
+
+| Stare | Ce face |
+|---|---|
+| **de verificat** | Apare în dashboard; nu mai alertează; nu devine „normală” niciodată automat |
+| **normal** („E normal”) | Nu mai alertează |
+| **suspect** („Nu recunosc”) | Orice conexiune nouă către ea alertează critic, ignorând cooldown-ul |
+
+Deciziile se iau la nivel de companie: „E normal” la Google acoperă toate
+blocurile Google.
+
+## Grupare pe companii (`companies.py`)
+
+Două liste scrise de mână: domenii (`1e100.net` → Google) și intervale de
+IP-uri publice cunoscute (acoperă adresele fără reverse DNS). Pe datele reale
+de dezvoltare, 96 din 97 de destinații distincte au fost identificate;
+restul rămân „rețea neidentificată”. Aplicația nu ghicește niciodată o
+companie.
+
+Ca să adaugi o mapare: editezi `DOMAIN_COMPANIES`, `_PREFIXES_BY_COMPANY` și,
+pentru o companie nouă, `COMPANIES` (cu o descriere), apoi rulezi
+`python3 -m pytest -q test_companies.py` și repornești watcher-ul. Rândurile
+existente din „De verificat” se contopesc automat pe noua companie.
+
+## Retenția datelor (`retention.py`)
+
+Rulează automat la pornirea watcher-ului și la fiecare 6 ore.
+
+- `connections`: 14 zile
+- `inbound_events`: 90 de zile
+- tot restul (destinații cunoscute, decizii, istoric) se păstrează
+
+În `connections` se scrie doar o conexiune **nouă** (care nu era deschisă la
+citirea precedentă), nu fiecare conexiune la fiecare secundă (ritmul vechi:
+~275 MB/zi).
+
+Ștergerea oprește creșterea bazei, dar nu micșorează fișierul. Pentru asta,
+cu watcher-ul și dashboard-ul oprite: `python3 retention.py --vacuum`.
+`python3 retention.py --dry-run` arată ce s-ar șterge, fără să șteargă.
+
+## Securitatea dashboard-ului
+
+Dashboard-ul ascultă doar pe `127.0.0.1` și nu are autentificare. Fiindcă
+poate scrie decizii, acceptă cereri doar dacă `Host` și `Origin` sunt cele
+ale dashboard-ului și corpul e JSON (un site deschis în alt tab nu poate
+apăsa „E normal” în numele utilizatorului). Textele care vin din rețea
+(nume de host, procese) sunt escapate înainte să ajungă în pagină.
+
+## Teste
 
 ```bash
-# Terminal 1 — colectare + analiză de risc + alertare live
-sudo python3 watcher_v6.py
-
-# Terminal 2 — dashboard web (fără sudo, doar citește)
-python3 dashboard.py
+python3 -m pytest -q
 ```
 
-Apoi deschide browserul la `http://localhost:5000`.
+108 teste: baseline, watcher, stările destinațiilor, dashboard, retenție,
+companii (inclusiv pe o listă reală de destinații, `tests_real_keys.txt`) și
+scrierea conexiunilor noi. `conftest.py` izolează jurnalul de alerte, ca
+testele să nu scrie în `alerts.log`-ul real.
 
-`collector.py` există separat pentru cazul în care vrei doar colectare brută,
-fără analiză live — nu se rulează de obicei în paralel cu `watcher_v6.py`,
-care face deja ambele.
+## Limitări cunoscute
 
-### Interfața web
-
-- **Procese active (24h)** — cine vorbește cu cine, câte conexiuni, câte
-  IP-uri distincte
-- **Jurnal alerte** — istoricul alertelor de risc
-- **Conexiuni primite (inbound)** — potențiale scanări/atacuri către mașină
-- **Conexiuni noi observate** — combinații (proces, IP) văzute prima dată
-
-Se auto-reîmprospătează la 5 secunde.
-
-### Probleme cunoscute
-
-- Rularea cu `sudo` e necesară ca `psutil` să vadă toate conexiunile (nu doar
-  ale userului curent), dar notificările desktop (`notify-send`) pot eșua cu
-  `ServiceUnknown: org.freedesktop.Notifications`, pentru că root nu are
-  acces direct la sesiunea D-Bus grafică a userului. Fără `sudo` dispare
-  eroarea, dar se pierde vizibilitatea pe procesele altor useri.
-- Detecția de beaconing e sensibilă la o singură întrerupere în pattern: un
-  gol izolat în intervalele altfel regulate poate crește suficient
-  coeficientul de variație încât să scape de sub prag, chiar dacă restul
-  traficului e clar regulat.
-
-## Whitelist comportamental (destinații cunoscute per proces)
-
-Pe lângă concentrare/beaconing, `watcher_v6.py` ține minte, per proces,
-ce destinații sunt "normale" pentru el, ca să deosebească o conexiune nouă
-banală (IP nou pentru un serviciu deja cunoscut) de o schimbare reală de
-comportament (proces cunoscut, infrastructură complet nouă).
-
-Lanțul de decizie, per conexiune ieșită:
-
-```
-IP -> reverse DNS (domeniu) -> dacă lipsește, subnet /24 (IPv4) sau /48 (IPv6)
-   -> compară cu known_destinations (proces, cheie)
-   -> dacă procesul e deja cunoscut ȘI cheia e complet nouă -> candidat de alertă
-   -> cooldown per proces (5 min) -> alertă reală ("[NOU-COMPORTAMENT]")
-```
-
-- Reverse DNS reușește pe doar ~43% din IP-urile externe observate — restul
-  cad pe fallback-ul de subnet, care ajută mult pe infrastructuri compacte
-  (Google, Cloudflare pe IPv6), dar aproape deloc pe cloud-uri mari cu
-  alocare împrăștiată (Azure)
-- IP-urile IPv4-mascate-ca-IPv6 (`::ffff:x.x.x.x`) primesc tratare specială
-  (a doua oară că acest format cauzează o capcană în proiect, după
-  `is_effectively_loopback()`)
-- Cooldown-ul per proces reduce zgomotul de burst (testat pe un caz real:
-  15 candidate -> 4 alerte reale, când Chrome a deschis Netflix și a atins
-  11 destinații Google/Netflix noi în 18 secunde)
-- La prima pornire, `known_destinations` se populează automat din tot
-  istoricul deja colectat (backfill), ca să nu pornească de la zero
-- Notificarea veche `[info] Conexiune nouă` rămâne neschimbată, complet
-  aditiv — `[NOU-COMPORTAMENT]` e un semnal separat, mai rar și mai relevant
+- **Grupare pe companii vs. detecție:** un program care vorbește deja cu o
+  companie mare de cloud (Amazon, Cloudflare) nu primește alertă de
+  „comportament nou” pentru o adresă nouă a aceleiași companii. Un server
+  rău intenționat găzduit acolo scapă de această regulă; concentrarea și
+  beaconing-ul rămân active.
+- **Liste manuale:** `companies.py` e incomplet și trebuie întreținut. Pe alte
+  mașini acoperirea va fi mai mică decât pe datele de dezvoltare.
+- **Rularea cu `sudo`:** necesară ca `psutil` să vadă toate conexiunile, dar
+  `notify-send` poate eșua cu `ServiceUnknown` (root nu are acces la sesiunea
+  D-Bus a utilizatorului).
+- **Beaconing:** regularitatea se analizează doar pe sesiunea cea mai mare;
+  una mai mică și mai veche e ignorată.
+- **Fără autentificare** în dashboard (doar acces local).
+- **Contoare:** după trecerea la „doar conexiuni noi”, contoarele din
+  dashboard (24h) scad treptat pe măsură ce rândurile vechi, scrise la
+  secundă, ies din fereastră.
 
 ## Stadiu curent
 
-- Prototip funcțional, testat pe date reale capturate (Firefox, Chrome,
-  Cursor, VS Code, curl simulat, nc) și pe VM-uri Kali/Metasploitable2
-- 26 de teste automate (`test_baseline.py`, `test_watcher.py`), toate trec
-- Integrarea AbuseIPDB (reputație externă de IP) a fost eliminată — nu se
-  potrivea cu premisa centrală axată pe comportament, nu pe liste externe
-- Whitelist comportamental (domeniu/subnet + cooldown), validat pe date
-  reale, integrat în `watcher_v6.py` și în `experiment_reverse_dns.py`
-  (scriptul izolat folosit pentru dezvoltare incrementală, păstrat ca
-  documentație a procesului)
+- Prototip funcțional, testat pe date reale (Firefox, Chrome, Cursor,
+  VS Code, curl simulat, nc) și pe VM-uri Kali/Metasploitable2
+- Alerta „de verificat” și deciziile utilizatorului funcționează cap-coadă
+- Gruparea pe companii a redus lista „de verificat” de la 29 la 10 pe datele
+  reale
 
-## Următorii pași posibili
+## Următorii pași
 
-- Rafinare ASN (în loc de subnet /24) pentru gruparea cloud-urilor mari,
-  cu o bază de date externă (ex. MaxMind GeoLite2-ASN)
-- Listă de sufixe publice (public suffix list) pentru `extract_base_domain`,
-  ca să trateze corect domenii tip `ceva.co.uk`
-- UI în dashboard pentru gestionarea manuală a whitelist-ului
+- Rularea ca serviciu (un singur proces, pornit odată cu sistemul;
+  rezolvă conflictul `sudo` vs. notificări)
+- Test pe 2-3 mașini: câte alerte false pe zi, ce procent din destinații e
+  identificat pe date pe care lista nu le-a văzut
+- Bază ASN pentru identificarea oricărei adrese (ex. iptoasn.com, domeniu
+  public — verificat termenii licenței înainte de distribuire)
+- Listă de sufixe publice pentru `extract_base_domain` (domenii tip
+  `ceva.co.uk`)
+- Fișier local de mapări (`companies_local.json`), fără editarea codului
+- Versiuni pentru Windows și macOS
 
 ## Mediu de testare
 
