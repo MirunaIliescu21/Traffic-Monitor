@@ -18,6 +18,7 @@ class TestCompanyFor:
         ("pub.ro", "domeniu", "Universitatea Politehnica București"),
         ("2001:4860:4840::/48", "subnet", "Google"),
         ("13.69.68.0/24", "subnet", "Microsoft"),
+        ("51.11.192.0/24", "subnet", "Microsoft"),
         ("2606:4700:4403::/48", "subnet", "Cloudflare"),
         ("3.160.246.0/24", "subnet", "Amazon"),
         ("146.75.121.0/24", "subnet", "Fastly"),
